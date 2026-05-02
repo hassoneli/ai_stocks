@@ -1,0 +1,28 @@
+pm v5
+-----
+* Fixed start price
+
+pm v3
+-----
+* Working pm
+
+v6
+--
+* Moved to google gemini
+* General news works.
+* runs every 10 mins
+
+v4
+---
+1. general news should work now.
+
+v2
+--
+1. multi ticker is working.
+2. sending usefull emails.
+
+v1
+---
+1. db is working.
+2. news is working.
+3. accessing openai is working
