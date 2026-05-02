@@ -91,6 +91,9 @@ MARKET_CLOSE = dt.time(16, 0)
 # In-memory tracker for price alerts sent today. Reset daily by a scheduled job.
 ALERTS_SENT_TODAY: set[str] = set()
 
+# Tracker for tickers that have exceeded threshold and need hourly alerts
+THRESHOLD_EXCEEDED_TICKERS: dict[str, dict] = {}
+
 def reset_daily_alerts() -> None:
     """
     Scheduled to run once a day to clear the set of tickers that have had
@@ -196,16 +199,56 @@ def check_ticker(ticker: str) -> None:
     pct, last_price = result
     logger.info("%s: price=$%.2f, change=%.2f%%", ticker, last_price, pct)
 
-    if abs(pct) >= THRESHOLD and ticker not in ALERTS_SENT_TODAY:
-        direction = "up" if pct > 0 else "down"
-        subject = f"{ticker} moved {pct:.2f}% {direction} today"
-        body = (
-            f"{ticker} has moved {pct:.2f}% {direction} from today’s open, "
-            f"exceeding the {THRESHOLD}% threshold."
-        )
-        send_email(subject, body)
-        ALERTS_SENT_TODAY.add(ticker)
-        logger.info(body)
+    # Track threshold exceeded tickers
+    if abs(pct) >= THRESHOLD:
+        if ticker not in THRESHOLD_EXCEEDED_TICKERS:
+            THRESHOLD_EXCEEDED_TICKERS[ticker] = {
+                'pct_change': pct,
+                'last_price': last_price,
+                'alert_sent': False,
+                'first_exceeded': dt.datetime.now(ET_TZ)
+            }
+        else:
+            THRESHOLD_EXCEEDED_TICKERS[ticker]['pct_change'] = pct
+            THRESHOLD_EXCEEDED_TICKERS[ticker]['last_price'] = last_price
+            
+        # Send initial alert if not already sent
+        if ticker not in ALERTS_SENT_TODAY:
+            direction = "up" if pct > 0 else "down"
+            subject = f"{ticker} moved {pct:.2f}% {direction} today"
+            body = (
+                f"{ticker} has moved {pct:.2f}% {direction} from today's open, "
+                f"exceeding the {THRESHOLD}% threshold."
+            )
+            send_email(subject, body)
+            ALERTS_SENT_TODAY.add(ticker)
+            logger.info(body)
+    else:
+        # Reset tracking if price is back within threshold
+        if ticker in THRESHOLD_EXCEEDED_TICKERS:
+            THRESHOLD_EXCEEDED_TICKERS[ticker]['alert_sent'] = False
+
+
+def send_hourly_alerts() -> None:
+    """Send hourly email alerts for tickers that have exceeded the threshold."""
+    now = dt.datetime.now(ET_TZ)
+    
+    for ticker, data in list(THRESHOLD_EXCEEDED_TICKERS.items()):
+        # Only send hourly alerts if the threshold was exceeded and alert hasn't been sent yet
+        if not data['alert_sent']:
+            # Check if it's been at least an hour since the threshold was first exceeded
+            time_diff = now - data['first_exceeded']
+            if time_diff.total_seconds() >= 3600:  # 1 hour
+                pct = data['pct_change']
+                direction = "up" if pct > 0 else "down"
+                subject = f"{ticker} still {pct:.2f}% {direction} (hourly update)"
+                body = (
+                    f"{ticker} has remained {pct:.2f}% {direction} from today's open "
+                    f"for over an hour. Threshold: {THRESHOLD}%."
+                )
+                send_email(subject, body)
+                data['alert_sent'] = True
+                logger.info(body)
 
 
 def poll_once() -> None:
@@ -224,6 +267,8 @@ def main() -> None:
     sched.add_job(poll_once, "interval", seconds=INTERVAL_SEC, next_run_time=dt.datetime.now(dt.timezone.utc))
     # Job to reset the daily alert tracker
     sched.add_job(reset_daily_alerts, "cron", hour=0, minute=15)  # Reset daily at 00:05 UTC
+    # Job to send hourly alerts for tickers that have exceeded threshold
+    sched.add_job(send_hourly_alerts, "interval", minutes=60)
     sched.start()
 
     logger.info(
