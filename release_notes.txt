@@ -1,6 +1,7 @@
 pm v5
 -----
 * Fixed start price
+* Added hourly email notifications for price movements exceeding 4% threshold
 
 pm v3
 -----
