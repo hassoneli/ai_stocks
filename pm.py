@@ -186,6 +186,9 @@ def send_email(subject: str, body: str) -> None:
         logger.info("📧 Sent e‑mail: %s", subject)
     except smtplib.SMTPException:
         logger.exception("SMTP failure sending alert")
+    except Exception:
+        logger.exception("Unexpected error sending email")
+
 
 # ---------------------------------------------------------------------------
 # Core monitoring loop
@@ -252,11 +255,13 @@ def send_hourly_alerts() -> None:
 
 
 def poll_once() -> None:
+    logger.info("Starting polling cycle")
     for t in TICKERS:
         try:
             check_ticker(t)
         except Exception:
             logger.exception("Unhandled error processing %s", t)
+    logger.info("Completed polling cycle")
 
 
 def main() -> None:
@@ -266,7 +271,7 @@ def main() -> None:
     # Job to poll for price changes every N seconds
     sched.add_job(poll_once, "interval", seconds=INTERVAL_SEC, next_run_time=dt.datetime.now(dt.timezone.utc))
     # Job to reset the daily alert tracker
-    sched.add_job(reset_daily_alerts, "cron", hour=0, minute=15)  # Reset daily at 00:05 UTC
+    sched.add_job(reset_daily_alerts, "cron", hour=0, minute=15)  # Reset daily at 00:15 UTC
     # Job to send hourly alerts for tickers that have exceeded threshold
     sched.add_job(send_hourly_alerts, "interval", minutes=60)
     sched.start()
