@@ -1,3 +1,7 @@
+pm v7
+-----
+* Fix to price change calculation - ensuring previous close is from previous trading day
+
 pm v5
 -----
 * Fixed start price

@@ -138,20 +138,15 @@ def fetch_price_and_change(raw_ticker: str) -> tuple[float, float] | None:
 
     today = now_ny.date()
 
-    # — 2 — authoritative previous-close -------------------------------------
-    # We request 2 daily bars so the penultimate row is always "yesterday".
+    # — 2 — authoritative today's open ---------------------------------------
+    # We request 2 daily bars so the last row is always "today".
     daily = yf.Ticker(ticker).history(period="2d", interval="1d", auto_adjust=False)
     if len(daily) < 1:
         logger.info("%s: no daily data", ticker)
         return None
 
-    if len(daily) == 1:
-        # This can happen on Mondays or right after listings/holidays.
-        logger.info("%s: only one daily bar – insufficient history", ticker)
-        return None
-
-    prev_close = float(daily["Close"].iloc[-2])  # yesterday’s close
-    logger.info("prev_close: %.2f", prev_close)
+    today_open = float(daily["Open"].iloc[-1])  # today's open
+    logger.info("today_open: %.2f", today_open)
 
     # — 3 — latest trade price (1-min bar) -----------------------------------
     minute = yf.Ticker(ticker).history(
@@ -165,7 +160,7 @@ def fetch_price_and_change(raw_ticker: str) -> tuple[float, float] | None:
         return None
 
     last_price = float(minute["Close"].dropna().iloc[-1])
-    pct_change = (last_price - prev_close) / prev_close * 100
+    pct_change = (last_price - today_open) / today_open * 100
     logger.info("pct_change: %.2f last price: %.2f", pct_change, last_price)
 
     return pct_change, last_price
