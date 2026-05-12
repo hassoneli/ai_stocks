@@ -224,7 +224,7 @@ def check_ticker(ticker: str) -> None:
     else:
         # Reset tracking if price is back within threshold
         if ticker in THRESHOLD_EXCEEDED_TICKERS:
-            THRESHOLD_EXCEEDED_TICKERS[ticker]['alert_sent'] = False
+            del THRESHOLD_EXCEEDED_TICKERS[ticker]
 
 
 def send_hourly_alerts() -> None:
