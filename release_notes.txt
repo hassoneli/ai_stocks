@@ -1,3 +1,8 @@
+pm v8
+-----
+* Price change is now calculated from previous close instead of today's open
+* Added hourly email notifications for price movements exceeding 4% threshold.
+
 pm v7
 -----
 * Fix to price change calculation - ensuring previous close is from previous trading day

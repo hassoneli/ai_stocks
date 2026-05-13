@@ -3,7 +3,7 @@
 AI Stock Price Monitor (env‑strict, intraday‑aware)
 -------------------------------------------------
 Watches selected tickers and sends a single e‑mail alert when the price moves
-±N % from **today’s open** *during regular U.S. market hours*.
+±N % from **previous close** *during regular U.S. market hours*.
 
 Why this revision?
     • Earlier versions treated an empty 1‑minute history before 09:30 ET as a
@@ -138,15 +138,19 @@ def fetch_price_and_change(raw_ticker: str) -> tuple[float, float] | None:
 
     today = now_ny.date()
 
-    # — 2 — authoritative today's open ---------------------------------------
-    # We request 2 daily bars so the last row is always "today".
-    daily = yf.Ticker(ticker).history(period="2d", interval="1d", auto_adjust=False)
-    if len(daily) < 1:
+    # — 2 — authoritative previous close ---------------------------------------
+    daily = yf.Ticker(ticker).history(period="5d", interval="1d", auto_adjust=False)
+    if daily.empty:
         logger.info("%s: no daily data", ticker)
         return None
 
-    today_open = float(daily["Open"].iloc[-1])  # today's open
-    logger.info("today_open: %.2f", today_open)
+    past_daily = daily[daily.index.date < today]
+    if past_daily.empty:
+        logger.info("%s: no past daily data", ticker)
+        return None
+
+    prev_close = float(past_daily["Close"].iloc[-1])  # previous close
+    logger.info("prev_close: %.2f", prev_close)
 
     # — 3 — latest trade price (1-min bar) -----------------------------------
     minute = yf.Ticker(ticker).history(
@@ -160,7 +164,7 @@ def fetch_price_and_change(raw_ticker: str) -> tuple[float, float] | None:
         return None
 
     last_price = float(minute["Close"].dropna().iloc[-1])
-    pct_change = (last_price - today_open) / today_open * 100
+    pct_change = (last_price - prev_close) / prev_close * 100
     logger.info("pct_change: %.2f last price: %.2f", pct_change, last_price)
 
     return pct_change, last_price
@@ -215,7 +219,7 @@ def check_ticker(ticker: str) -> None:
             direction = "up" if pct > 0 else "down"
             subject = f"{ticker} moved {pct:.2f}% {direction} today"
             body = (
-                f"{ticker} has moved {pct:.2f}% {direction} from today's open, "
+                f"{ticker} has moved {pct:.2f}% {direction} from previous close, "
                 f"exceeding the {THRESHOLD}% threshold."
             )
             send_email(subject, body)
@@ -241,7 +245,7 @@ def send_hourly_alerts() -> None:
                 direction = "up" if pct > 0 else "down"
                 subject = f"{ticker} still {pct:.2f}% {direction} (hourly update)"
                 body = (
-                    f"{ticker} has remained {pct:.2f}% {direction} from today's open "
+                    f"{ticker} has remained {pct:.2f}% {direction} from previous close "
                     f"for over an hour. Threshold: {THRESHOLD}%."
                 )
                 send_email(subject, body)
