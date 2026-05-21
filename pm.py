@@ -119,7 +119,7 @@ def market_session_now() -> str:
 
 NY_TZ = pytz.timezone("America/New_York")
 
-def fetch_price_and_change(raw_ticker: str) -> tuple[float, float] | None:
+def fetch_price_and_change(raw_ticker: str, force: bool = False) -> tuple[float, float] | None:
     """
     Return (pct_change_since_prev_close, last_price) or None
     when the US equity market is closed / no data yet.
@@ -128,7 +128,7 @@ def fetch_price_and_change(raw_ticker: str) -> tuple[float, float] | None:
     now_ny = dt.datetime.now(tz=NY_TZ)
 
     # — 1 — session-open guard ------------------------------------------------
-    if (
+    if not force and (
         now_ny.weekday() >= 5                # weekend
         or now_ny.time() < dt.time(9, 30)    # pre-market
         or now_ny.time() >= dt.time(16, 0)   # post-close
@@ -193,10 +193,10 @@ def send_email(subject: str, body: str) -> None:
 # Core monitoring loop
 # ---------------------------------------------------------------------------
 
-def check_ticker(ticker: str) -> None:
-    result = fetch_price_and_change(ticker)
+def check_ticker(ticker: str, force: bool = False) -> tuple[float, float] | None:
+    result = fetch_price_and_change(ticker, force=force)
     if result is None:
-        return
+        return None
 
     pct, last_price = result
     logger.info("%s: price=$%.2f, change=%.2f%%", ticker, last_price, pct)
@@ -230,6 +230,8 @@ def check_ticker(ticker: str) -> None:
         if ticker in THRESHOLD_EXCEEDED_TICKERS:
             del THRESHOLD_EXCEEDED_TICKERS[ticker]
 
+    return result
+
 
 def send_hourly_alerts() -> None:
     """Send hourly email alerts for tickers that have exceeded the threshold."""
@@ -253,6 +255,36 @@ def send_hourly_alerts() -> None:
                 logger.info(body)
 
 
+def send_end_of_day_update() -> None:
+    """
+    Fetches the final prices at the end of the trade day and sends
+    a single combined email update for all monitored tickers.
+    Also ensures any final threshold alerts are processed.
+    """
+    logger.info("Running end of trade-day price checks")
+    lines = []
+    for ticker in TICKERS:
+        try:
+            result = check_ticker(ticker, force=True)
+            if result is not None:
+                pct, last_price = result
+                lines.append(f"• {ticker}: ${last_price:.2f} ({pct:+.2f}%)")
+            else:
+                lines.append(f"• {ticker}: No data available")
+        except Exception:
+            logger.exception("Error during final trade-day check for %s", ticker)
+            lines.append(f"• {ticker}: Error fetching price")
+
+    if lines:
+        subject = "End of Trade-Day Price Update"
+        body = (
+            "Here is the final price update for your monitored tickers at the market close:\n\n"
+            + "\n".join(lines)
+        )
+        send_email(subject, body)
+        logger.info("Sent end of trade-day price update email.")
+
+
 def poll_once() -> None:
     logger.info("Starting polling cycle")
     for t in TICKERS:
@@ -273,6 +305,15 @@ def main() -> None:
     sched.add_job(reset_daily_alerts, "cron", hour=0, minute=15)  # Reset daily at 00:15 UTC
     # Job to send hourly alerts for tickers that have exceeded threshold
     sched.add_job(send_hourly_alerts, "interval", minutes=60)
+    # Job to send the final price update at the end of the trade-day (16:00 US/Eastern)
+    sched.add_job(
+        send_end_of_day_update,
+        "cron",
+        day_of_week="mon-fri",
+        hour=16,
+        minute=0,
+        timezone=ET_TZ,
+    )
     sched.start()
 
     logger.info(
