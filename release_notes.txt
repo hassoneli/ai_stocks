@@ -1,3 +1,7 @@
+alive v9
+---------
+* sends emails if servers down
+
 pm v8
 -----
 * Price change is now calculated from previous close instead of today's open
