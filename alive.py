@@ -478,6 +478,24 @@ def run_checks(db_path: str = DB_PATH) -> None:
         
     check_and_send_weekly_email_if_due(db_path=db_path)
 
+def get_poll_interval_minutes() -> int:
+    servers_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".servers_env")
+    val = None
+    if os.path.exists(servers_env_path):
+        cfg = dotenv_values(servers_env_path)
+        val = cfg.get("POLL_INTERVAL_MINUTES") or cfg.get("POLL_INTERVAL_SEC") or cfg.get("POLL_INTERVAL")
+    
+    if not val:
+        val = os.environ.get("POLL_INTERVAL_MINUTES") or os.environ.get("POLL_INTERVAL_SEC") or os.environ.get("POLL_INTERVAL") or "60"
+        
+    try:
+        ival = int(val)
+        if ival >= 60 and ("SEC" in str(val).upper() or ival >= 300):
+            return max(1, ival // 60)
+        return max(1, ival)
+    except ValueError:
+        return 60
+
 # ---------------------------------------------------------------------------
 # Main & Scheduler Execution
 # ---------------------------------------------------------------------------
@@ -486,7 +504,7 @@ def main() -> None:
     parser.add_argument(
         "--daemon",
         action="store_true",
-        help="Run as a background daemon service checking hourly and sending weekly reports",
+        help="Run as a background daemon service checking at specified poll interval and sending weekly reports",
     )
     parser.add_argument(
         "--weekly-report",
@@ -503,18 +521,23 @@ def main() -> None:
     if args.daemon:
         from apscheduler.schedulers.background import BackgroundScheduler
         
+        poll_mins = get_poll_interval_minutes()
         sched = BackgroundScheduler()
         
-        # Schedule check job hourly at minute 0
-        sched.add_job(run_checks, "cron", minute=0)
+        # Schedule check job based on poll interval (minute 0 for hourly, interval for custom minutes)
+        if poll_mins == 60:
+            sched.add_job(run_checks, "cron", minute=0, misfire_grace_time=3600)
+        else:
+            sched.add_job(run_checks, "interval", minutes=poll_mins, misfire_grace_time=3600)
         
-        # Schedule weekly report job
+        # Schedule weekly report job with misfire grace time
         sched.add_job(
             send_weekly_status_email,
             "cron",
             day_of_week=WEEKLY_REPORT_DAY,
             hour=WEEKLY_REPORT_HOUR,
-            minute=0
+            minute=0,
+            misfire_grace_time=86400,
         )
         
         # Trigger an immediate check on startup
@@ -522,8 +545,8 @@ def main() -> None:
         
         sched.start()
         logger.info(
-            "SSH Server Monitor started in daemon mode. Hourly checks scheduled (minute 0), weekly report scheduled (%s at %02d:00).",
-            WEEKLY_REPORT_DAY.upper(), WEEKLY_REPORT_HOUR
+            "SSH Server Monitor started in daemon mode. Polling interval: every %d minute(s). Weekly report scheduled (%s at %02d:00).",
+            poll_mins, WEEKLY_REPORT_DAY.upper(), WEEKLY_REPORT_HOUR
         )
         
         try:

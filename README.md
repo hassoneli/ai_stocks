@@ -27,7 +27,7 @@ A script that monitors SSH servers hourly, logs aliveness history to SQLite (`al
    ```
 
 ### Execution Modes
-* **Single Check Run** (used by crontab for hourly checks):
+* **Single Check Run**:
   ```bash
   python alive.py
   ```
@@ -35,13 +35,24 @@ A script that monitors SSH servers hourly, logs aliveness history to SQLite (`al
   ```bash
   python alive.py --weekly-report
   ```
-* **Daemon Scheduler Mode** (runs continuously, checking hourly at minute 0 and sending weekly status reports every Monday at 9:00 AM):
+* **Daemon Scheduler Mode** (runs continuously in background, checking hourly at minute 0 and sending weekly status reports every Monday at 9:00 AM):
   ```bash
   python alive.py --daemon
   ```
 
-### Crontab Setup
-Installed in user crontab (`crontab -e`):
+### Running on Termux / POCO (Android proot-distro)
+On Termux / proot containers, standard system `cron` services are often not running in the background. Instead, use the built-in daemon mode:
+
+1. Start background daemon runner:
+   ```bash
+   ./start_daemon.sh
+   ```
+2. Optional (Termux wake lock to prevent Android OS sleeping process):
+   ```bash
+   termux-wake-lock
+   ```
+
+### Standard Linux Crontab Setup
 ```cron
 0 * * * * /home/eli/projects/ai_stocks/venv/bin/python /home/eli/projects/ai_stocks/alive.py >> /home/eli/projects/ai_stocks/alive.log 2>&1
 ```
