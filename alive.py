@@ -74,6 +74,8 @@ SMTP_PORT = int(SMTP_PORT_RAW) if SMTP_PORT_RAW else 465
 SMTP_USER = os.environ.get("ALERTS_SMTP_USER") or os.environ.get("SMTP_USER")
 SMTP_PASS = os.environ.get("ALERTS_SMTP_PASS") or os.environ.get("SMTP_PASS")
 
+VERSION = "1.1.0"
+
 DB_PATH = os.environ.get("ALIVE_DB_PATH", "alive_history.db")
 WEEKLY_REPORT_DAY = os.environ.get("ALIVE_WEEKLY_DAY", "mon").lower()
 WEEKLY_REPORT_HOUR = int(os.environ.get("ALIVE_WEEKLY_HOUR", "9"))
@@ -441,7 +443,8 @@ def check_ssh_server(server: dict) -> tuple[bool, str]:
 # Core monitoring function
 # ---------------------------------------------------------------------------
 def run_checks(db_path: str = DB_PATH) -> None:
-    logger.info("Starting SSH servers aliveness check...")
+    poll_mins = get_poll_interval_minutes()
+    logger.info("Starting SSH servers aliveness check [v%s] (Poll interval: %d mins)...", VERSION, poll_mins)
     servers = load_monitored_servers()
     
     if not servers:
@@ -511,8 +514,16 @@ def main() -> None:
         action="store_true",
         help="Send the weekly status email report immediately",
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}",
+    )
     args = parser.parse_args()
     
+    poll_mins = get_poll_interval_minutes()
+    logger.info("SSH Server Monitor v%s (Configured Poll Interval: %d mins)", VERSION, poll_mins)
+
     if args.weekly_report:
         logger.info("Manual trigger: Sending weekly status email report...")
         send_weekly_status_email(force=True)
@@ -521,14 +532,16 @@ def main() -> None:
     if args.daemon:
         from apscheduler.schedulers.background import BackgroundScheduler
         
-        poll_mins = get_poll_interval_minutes()
         sched = BackgroundScheduler()
         
-        # Schedule check job based on poll interval (minute 0 for hourly, interval for custom minutes)
-        if poll_mins == 60:
-            sched.add_job(run_checks, "cron", minute=0, misfire_grace_time=3600)
-        else:
-            sched.add_job(run_checks, "interval", minutes=poll_mins, misfire_grace_time=3600)
+        # Schedule check job every poll_mins minutes starting immediately
+        sched.add_job(
+            run_checks,
+            "interval",
+            minutes=poll_mins,
+            next_run_time=dt.datetime.now(),
+            misfire_grace_time=3600
+        )
         
         # Schedule weekly report job with misfire grace time
         sched.add_job(
@@ -540,13 +553,10 @@ def main() -> None:
             misfire_grace_time=86400,
         )
         
-        # Trigger an immediate check on startup
-        sched.add_job(run_checks, "date", run_date=dt.datetime.now())
-        
         sched.start()
         logger.info(
-            "SSH Server Monitor started in daemon mode. Polling interval: every %d minute(s). Weekly report scheduled (%s at %02d:00).",
-            poll_mins, WEEKLY_REPORT_DAY.upper(), WEEKLY_REPORT_HOUR
+            "SSH Server Monitor v%s started in daemon mode. Polling interval: every %d minute(s). Weekly report scheduled (%s at %02d:00).",
+            VERSION, poll_mins, WEEKLY_REPORT_DAY.upper(), WEEKLY_REPORT_HOUR
         )
         
         try:
