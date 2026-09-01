@@ -1,3 +1,4 @@
 .env
 venv/
 .servers_env
+alive_history.db
