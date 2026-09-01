@@ -2,9 +2,9 @@
 """
 SSH Server Aliveness Monitor
 ---------------------------
-Connects to SSH servers defined in `.servers_env` once a day (in daemon mode)
-or instantly (in single-run mode), and sends an email alert if one or more of
-them are not alive.
+Connects to SSH servers defined in `.servers_env` hourly (in daemon mode
+or via crontab), logs status history to SQLite, sends alert emails
+when servers are down, and sends a weekly status report email.
 
 Required environment variables in `.env` (for email alerts):
     ALERTS_EMAIL_FROM       Sender address
@@ -14,6 +14,11 @@ Required environment variables in `.env` (for email alerts):
     ALERTS_SMTP_USER        SMTP username
     ALERTS_SMTP_PASS        SMTP password / app‑password
 
+Optional environment variables:
+    ALIVE_DB_PATH           SQLite database path (default: alive_history.db)
+    ALIVE_WEEKLY_DAY        Day for weekly report in daemon mode (default: mon)
+    ALIVE_WEEKLY_HOUR       Hour for weekly report in daemon mode (default: 9)
+
 SSH servers are configured in `.servers_env` with patterns like:
     SERVER_PROD_HOST=192.168.1.10
     SERVER_PROD_PORT=22
@@ -21,10 +26,13 @@ SSH servers are configured in `.servers_env` with patterns like:
     SERVER_PROD_KEY_PATH=~/.ssh/id_rsa
     
 Usage:
-    # Run once immediately (useful for testing or cron jobs)
+    # Run check once immediately (useful for hourly cron jobs)
     python alive.py
     
-    # Run as a daemon/service that checks once a day
+    # Send weekly status report email immediately
+    python alive.py --weekly-report
+    
+    # Run as a daemon that checks every hour and sends weekly email every Monday
     python alive.py --daemon
 """
 
@@ -34,6 +42,7 @@ import logging
 import os
 import socket
 import smtplib
+import sqlite3
 import sys
 import time
 from email.message import EmailMessage
@@ -62,6 +71,10 @@ SMTP_PORT = int(SMTP_PORT_RAW) if SMTP_PORT_RAW else 465
 SMTP_USER = os.environ.get("ALERTS_SMTP_USER") or os.environ.get("SMTP_USER")
 SMTP_PASS = os.environ.get("ALERTS_SMTP_PASS") or os.environ.get("SMTP_PASS")
 
+DB_PATH = os.environ.get("ALIVE_DB_PATH", "alive_history.db")
+WEEKLY_REPORT_DAY = os.environ.get("ALIVE_WEEKLY_DAY", "mon").lower()
+WEEKLY_REPORT_HOUR = int(os.environ.get("ALIVE_WEEKLY_HOUR", "9"))
+
 REQUIRED_EMAIL_VARS = {
     "EMAIL_FROM": EMAIL_FROM,
     "EMAIL_TO": EMAIL_TO,
@@ -82,7 +95,102 @@ def check_email_config() -> bool:
     return True
 
 # ---------------------------------------------------------------------------
-# Email helper
+# SQLite Database Helpers & History Tracking
+# ---------------------------------------------------------------------------
+def get_db_connection(db_path: str = DB_PATH) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db(db_path: str = DB_PATH) -> None:
+    with get_db_connection(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS checks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                server_name TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                is_alive INTEGER NOT NULL,
+                error TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        conn.commit()
+
+def log_check_results(all_servers_status: list[dict], db_path: str = DB_PATH) -> None:
+    init_db(db_path)
+    now_str = dt.datetime.now(dt.timezone.utc).isoformat()
+    with get_db_connection(db_path) as conn:
+        for s in all_servers_status:
+            conn.execute(
+                """
+                INSERT INTO checks (timestamp, server_name, host, port, is_alive, error)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (now_str, s["name"], s["host"], s["port"], 1 if s["is_alive"] else 0, s.get("error")),
+            )
+        conn.commit()
+
+def get_weekly_stats(db_path: str = DB_PATH, days: int = 7) -> dict:
+    init_db(db_path)
+    cutoff = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)).isoformat()
+    
+    stats = {}
+    with get_db_connection(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT server_name, host, port, is_alive, error, timestamp
+            FROM checks
+            WHERE timestamp >= ?
+            ORDER BY timestamp ASC
+            """,
+            (cutoff,),
+        ).fetchall()
+        
+        for r in rows:
+            name = r["server_name"]
+            if name not in stats:
+                stats[name] = {
+                    "name": name,
+                    "host": r["host"],
+                    "port": r["port"],
+                    "total_checks": 0,
+                    "success_count": 0,
+                    "fail_count": 0,
+                    "last_status": None,
+                    "failures": [],
+                }
+            
+            stats[name]["total_checks"] += 1
+            if r["is_alive"]:
+                stats[name]["success_count"] += 1
+            else:
+                stats[name]["fail_count"] += 1
+                stats[name]["failures"].append({
+                    "timestamp": r["timestamp"],
+                    "error": r["error"]
+                })
+            
+            stats[name]["last_status"] = {
+                "is_alive": bool(r["is_alive"]),
+                "timestamp": r["timestamp"],
+                "error": r["error"]
+            }
+            
+    for s in stats.values():
+        total = s["total_checks"]
+        s["uptime_pct"] = (s["success_count"] / total * 100.0) if total > 0 else 0.0
+        
+    return stats
+
+# ---------------------------------------------------------------------------
+# Email helpers (Alert & Weekly Status Email)
 # ---------------------------------------------------------------------------
 def send_alert_email(failed_servers: list[dict], all_servers_status: list[dict]) -> None:
     if not check_email_config():
@@ -91,7 +199,6 @@ def send_alert_email(failed_servers: list[dict], all_servers_status: list[dict])
 
     subject = f"⚠️ SSH Server Alert: {len(failed_servers)} server(s) not alive"
     
-    # Build email body
     now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     body = f"SSH Server Status Report (checked on {now_str})\n"
@@ -124,6 +231,101 @@ def send_alert_email(failed_servers: list[dict], all_servers_status: list[dict])
     except Exception:
         logger.exception("Unexpected error sending email")
 
+def send_weekly_status_email(force: bool = False, db_path: str = DB_PATH) -> None:
+    if not check_email_config():
+        logger.error("Skipping weekly email report due to missing email configuration.")
+        return
+
+    stats = get_weekly_stats(db_path=db_path, days=7)
+    servers = load_monitored_servers()
+    
+    all_server_names = set(s["name"] for s in servers) | set(stats.keys())
+    
+    now_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    date_str = dt.datetime.now().strftime("%Y-%m-%d")
+    subject = f"📊 SSH Server Weekly Status Report ({date_str})"
+    
+    body = f"SSH Server Weekly Status Report ({now_str})\n"
+    body += "=" * 65 + "\n\n"
+    
+    if not stats and not servers:
+        body += "No servers configured and no check history in the past 7 days.\n"
+    else:
+        body += "Server Summary (Past 7 Days):\n"
+        body += "-" * 65 + "\n"
+        body += f"{'Server Name':<20} | {'Uptime %':<10} | {'Checks':<8} | {'Passed/Failed':<13} | {'Current'}\n"
+        body += "-" * 65 + "\n"
+        
+        for name in sorted(all_server_names):
+            if name in stats:
+                st = stats[name]
+                uptime_str = f"{st['uptime_pct']:.1f}%"
+                checks_str = str(st['total_checks'])
+                pass_fail = f"{st['success_count']}/{st['fail_count']}"
+                current_icon = "✅ Alive" if (st['last_status'] and st['last_status']['is_alive']) else "❌ Down"
+                body += f"{st['name']:<20} | {uptime_str:<10} | {checks_str:<8} | {pass_fail:<13} | {current_icon}\n"
+            else:
+                body += f"{name:<20} | {'N/A':<10} | {'0':<8} | {'0/0':<13} | {'No Data'}\n"
+                
+        body += "\n" + "=" * 65 + "\n\n"
+        
+        has_failures = any(st.get("fail_count", 0) > 0 for st in stats.values())
+        if has_failures:
+            body += "Recent Incident Log (Past 7 Days):\n"
+            body += "-" * 65 + "\n"
+            for name, st in stats.items():
+                if st["failures"]:
+                    body += f"\nServer: {name} ({st['host']}:{st['port']})\n"
+                    for f in st["failures"][-10:]:
+                        ts = f['timestamp']
+                        err = f['error'] or 'Unknown error'
+                        body += f"  • [{ts}] {err}\n"
+        else:
+            body += "🎉 No outages recorded in the past 7 days! All checks passed.\n"
+            
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg.set_content(body)
+
+    try:
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as smtp:
+            smtp.login(SMTP_USER, SMTP_PASS)
+            smtp.send_message(msg)
+        logger.info("📧 Sent weekly status email report: %s", subject)
+        
+        with get_db_connection(db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_weekly_email', ?)",
+                (dt.datetime.now(dt.timezone.utc).isoformat(),)
+            )
+            conn.commit()
+    except smtplib.SMTPException:
+        logger.exception("SMTP failure sending weekly status email")
+    except Exception:
+        logger.exception("Unexpected error sending weekly status email")
+
+def check_and_send_weekly_email_if_due(db_path: str = DB_PATH) -> None:
+    init_db(db_path)
+    with get_db_connection(db_path) as conn:
+        row = conn.execute("SELECT value FROM metadata WHERE key = 'last_weekly_email'").fetchone()
+        
+    if not row:
+        stats = get_weekly_stats(db_path)
+        if stats:
+            logger.info("First run with check history recorded. Sending weekly email report...")
+            send_weekly_status_email(force=True, db_path=db_path)
+    else:
+        try:
+            last_sent = dt.datetime.fromisoformat(row["value"])
+            days_since = (dt.datetime.now(dt.timezone.utc) - last_sent).total_seconds() / 86400.0
+            if days_since >= 7.0:
+                logger.info("7 days elapsed since last weekly status email (%.1f days). Sending weekly report...", days_since)
+                send_weekly_status_email(force=True, db_path=db_path)
+        except Exception as e:
+            logger.warning("Error parsing last_weekly_email timestamp: %s", e)
+
 # ---------------------------------------------------------------------------
 # Server configuration parser
 # ---------------------------------------------------------------------------
@@ -131,7 +333,6 @@ def load_monitored_servers() -> list[dict]:
     servers_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".servers_env")
     if not os.path.exists(servers_env_path):
         logger.warning("`.servers_env` file not found. Creating a blank template.")
-        # Create a default template file if it doesn't exist
         with open(servers_env_path, "w") as f:
             f.write(
                 "# SSH Server monitoring configuration\n"
@@ -156,7 +357,6 @@ def load_monitored_servers() -> list[dict]:
             continue
             
         field = parts[-1].upper()
-        # Extract the server name/id in the middle, preserving inner underscores
         name = "_".join(parts[1:-1])
         
         if name not in servers:
@@ -176,7 +376,6 @@ def load_monitored_servers() -> list[dict]:
         elif field in ("KEY_PATH", "KEY"):
             servers[name]["key_path"] = value
 
-    # Filter out entries that lack a host
     valid_servers = [s for s in servers.values() if "host" in s]
     return valid_servers
 
@@ -215,7 +414,6 @@ def check_ssh_server(server: dict) -> tuple[bool, str]:
 
         client.connect(**connect_kwargs)
         
-        # Test command execution to verify shell is active
         stdin, stdout, stderr = client.exec_command("echo 'alive'", timeout=5)
         output = stdout.read().decode().strip()
         if output == "alive":
@@ -239,7 +437,7 @@ def check_ssh_server(server: dict) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 # Core monitoring function
 # ---------------------------------------------------------------------------
-def run_checks() -> None:
+def run_checks(db_path: str = DB_PATH) -> None:
     logger.info("Starting SSH servers aliveness check...")
     servers = load_monitored_servers()
     
@@ -267,11 +465,15 @@ def run_checks() -> None:
             logger.error("❌ Server %s is NOT alive: %s", server["name"], msg)
             failed_servers.append(status_info)
             
+    log_check_results(all_servers_status, db_path=db_path)
+    
     if failed_servers:
         logger.info("Found %d unavailable server(s). Sending alert email...", len(failed_servers))
         send_alert_email(failed_servers, all_servers_status)
     else:
         logger.info("All checked servers are alive. No alert email sent.")
+        
+    check_and_send_weekly_email_if_due(db_path=db_path)
 
 # ---------------------------------------------------------------------------
 # Main & Scheduler Execution
@@ -281,29 +483,44 @@ def main() -> None:
     parser.add_argument(
         "--daemon",
         action="store_true",
-        help="Run as a daemon/service that checks once a day using APScheduler",
+        help="Run as a background daemon service checking hourly and sending weekly reports",
+    )
+    parser.add_argument(
+        "--weekly-report",
+        action="store_true",
+        help="Send the weekly status email report immediately",
     )
     args = parser.parse_args()
     
+    if args.weekly_report:
+        logger.info("Manual trigger: Sending weekly status email report...")
+        send_weekly_status_email(force=True)
+        return
+
     if args.daemon:
         from apscheduler.schedulers.background import BackgroundScheduler
         
-        # Configure check time from environment if specified (default 09:00 local time)
-        hour = int(os.environ.get("ALIVE_CHECK_HOUR", "9"))
-        minute = int(os.environ.get("ALIVE_CHECK_MINUTE", "0"))
-        
         sched = BackgroundScheduler()
         
-        # Schedule the job to run daily at the specified hour:minute
-        sched.add_job(run_checks, "cron", hour=hour, minute=minute)
+        # Schedule check job hourly at minute 0
+        sched.add_job(run_checks, "cron", minute=0)
         
-        # Trigger an immediate check on startup so the daemon can be verified
+        # Schedule weekly report job
+        sched.add_job(
+            send_weekly_status_email,
+            "cron",
+            day_of_week=WEEKLY_REPORT_DAY,
+            hour=WEEKLY_REPORT_HOUR,
+            minute=0
+        )
+        
+        # Trigger an immediate check on startup
         sched.add_job(run_checks, "date", run_date=dt.datetime.now())
         
         sched.start()
         logger.info(
-            "SSH Server Monitor started in daemon mode. Scheduling daily checks at %02d:%02d local time.",
-            hour, minute
+            "SSH Server Monitor started in daemon mode. Hourly checks scheduled (minute 0), weekly report scheduled (%s at %02d:00).",
+            WEEKLY_REPORT_DAY.upper(), WEEKLY_REPORT_HOUR
         )
         
         try:
