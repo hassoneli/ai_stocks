@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-SSH Server Aliveness Monitor
+
+
+
+SH Server Aliveness Monitor
 ---------------------------
 Connects to SSH servers defined in `.servers_env` hourly (in daemon mode
 or via crontab), logs status history to SQLite, sends alert emails
@@ -398,8 +401,8 @@ def check_ssh_server(server: dict) -> tuple[bool, str]:
         connect_kwargs = {
             "hostname": host,
             "port": port,
-            "timeout": 10,
-            "banner_timeout": 10,
+            "timeout": 20,
+            "banner_timeout": 20,
         }
         if user:
             connect_kwargs["username"] = user
