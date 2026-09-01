@@ -74,7 +74,7 @@ SMTP_PORT = int(SMTP_PORT_RAW) if SMTP_PORT_RAW else 465
 SMTP_USER = os.environ.get("ALERTS_SMTP_USER") or os.environ.get("SMTP_USER")
 SMTP_PASS = os.environ.get("ALERTS_SMTP_PASS") or os.environ.get("SMTP_PASS")
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 DB_PATH = os.environ.get("ALIVE_DB_PATH", "alive_history.db")
 WEEKLY_REPORT_DAY = os.environ.get("ALIVE_WEEKLY_DAY", "mon").lower()
@@ -505,9 +505,14 @@ def get_poll_interval_minutes() -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description="SSH Server Aliveness Monitor")
     parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run check once and exit immediately instead of continuous polling",
+    )
+    parser.add_argument(
         "--daemon",
         action="store_true",
-        help="Run as a background daemon service checking at specified poll interval and sending weekly reports",
+        help="Run in continuous polling loop mode (default behavior)",
     )
     parser.add_argument(
         "--weekly-report",
@@ -529,45 +534,47 @@ def main() -> None:
         send_weekly_status_email(force=True)
         return
 
-    if args.daemon:
-        from apscheduler.schedulers.background import BackgroundScheduler
-        
-        sched = BackgroundScheduler()
-        
-        # Schedule check job every poll_mins minutes starting immediately
-        sched.add_job(
-            run_checks,
-            "interval",
-            minutes=poll_mins,
-            next_run_time=dt.datetime.now(),
-            misfire_grace_time=3600
-        )
-        
-        # Schedule weekly report job with misfire grace time
-        sched.add_job(
-            send_weekly_status_email,
-            "cron",
-            day_of_week=WEEKLY_REPORT_DAY,
-            hour=WEEKLY_REPORT_HOUR,
-            minute=0,
-            misfire_grace_time=86400,
-        )
-        
-        sched.start()
-        logger.info(
-            "SSH Server Monitor v%s started in daemon mode. Polling interval: every %d minute(s). Weekly report scheduled (%s at %02d:00).",
-            VERSION, poll_mins, WEEKLY_REPORT_DAY.upper(), WEEKLY_REPORT_HOUR
-        )
-        
-        try:
-            while True:
-                time.sleep(3600)
-        except (KeyboardInterrupt, SystemExit):
-            logger.info("Shutting down SSH Server Monitor...")
-            sched.shutdown()
-    else:
-        # Single-run mode
+    if args.once:
+        logger.info("Running in single-run mode (--once)...")
         run_checks()
+        return
+
+    # Default: Built-in continuous polling loop (No external cron required)
+    from apscheduler.schedulers.background import BackgroundScheduler
+    
+    sched = BackgroundScheduler()
+    
+    # Schedule check job every poll_mins minutes starting immediately
+    sched.add_job(
+        run_checks,
+        "interval",
+        minutes=poll_mins,
+        next_run_time=dt.datetime.now(),
+        misfire_grace_time=3600
+    )
+    
+    # Schedule weekly report job
+    sched.add_job(
+        send_weekly_status_email,
+        "cron",
+        day_of_week=WEEKLY_REPORT_DAY,
+        hour=WEEKLY_REPORT_HOUR,
+        minute=0,
+        misfire_grace_time=86400,
+    )
+    
+    sched.start()
+    logger.info(
+        "🚀 SSH Server Monitor v%s active. Polling continuously every %d minute(s). Weekly report scheduled (%s at %02d:00).",
+        VERSION, poll_mins, WEEKLY_REPORT_DAY.upper(), WEEKLY_REPORT_HOUR
+    )
+    
+    try:
+        while True:
+            time.sleep(3600)
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Shutting down SSH Server Monitor...")
+        sched.shutdown()
 
 if __name__ == "__main__":
     main()
